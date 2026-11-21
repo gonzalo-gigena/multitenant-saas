@@ -138,3 +138,93 @@ It runs alongside the RLS guard test in CI.
 ## Scaling notes
 - RLS adds a small cost per query; measure it (EXPLAIN ANALYZE with/without) and
   put the number in the README.
+
+## Beyond the plan
+
+Build these after the phases above. Each starts from a problem real systems hit, and
+each should add a row to the README's Decisions & tradeoffs table. If one wouldn't,
+skip it. B1 is the one to build first.
+
+### B1 — Move a large tenant to its own database, live
+**Why:** an enterprise customer requires dedicated storage, or one tenant is the noisy
+neighbor. The README already names the mechanism (a tenant → connection-string routing
+table). Build it.
+1. `tenant_routes(tenant_id, dsn, status)`. The api picks the pool for each request from
+   it (cached, invalidated on change). Every tenant starts on the shared database.
+2. Copy one tenant with Postgres logical replication and row filters (PG 15+):
+   `CREATE PUBLICATION tenant_x FOR TABLE appointments WHERE (tenant_id = '…'), …`.
+   Row filters on UPDATE and DELETE can only use columns in the replica identity, so
+   make `tenant_id` part of each primary key (or use `REPLICA IDENTITY FULL`).
+3. `FORCE ROW LEVEL SECURITY` applies to table owners too, so the subscription needs a
+   role with `BYPASSRLS` to write the rows.
+4. Cutover for that tenant only: block its writes briefly, wait for replication lag to
+   reach 0, flip the route, unblock. Other tenants never pause.
+5. Afterwards, delete the tenant's rows from the shared database in batches (worker).
+6. Some things don't move on their own: sequences, pg-boss jobs in flight, MinIO files.
+   Handle each one and list them in the README.
+- **Done when:** k6 keeps booking for that tenant the whole time, errors appear only
+  during the write freeze (measured in seconds), no booking is lost, and the other
+  tenants' p95 doesn't change.
+
+### B2 — Two-way calendar sync
+**Why:** the barber's dentist appointment is in Google Calendar, and the booking page
+still offers that slot. Booking products live or die on this.
+1. A fake calendar provider in `common/` next to the other fakes: events API,
+   incremental sync tokens, push notifications to a webhook, channels that expire.
+   A real Google Calendar connection is opt-in.
+2. External events become `busy_blocks` rows for that staff member, under the same
+   exclusion constraint as bookings, so the database still enforces "no overlap".
+3. Incremental sync with sync tokens, triggered by push notifications, plus a periodic
+   full sync because pushes get lost. The worker renews channels before they expire.
+   An expired sync token (HTTP 410) means a full resync.
+4. Bookings are written to the staff member's calendar idempotently (the booking ID is
+   stored on the external event).
+5. The race: a customer books a slot seconds before an external event for the same time
+   syncs. The constraint would reject that busy block, so store it as a conflict (the
+   constraint can carry `WHERE (NOT conflict)`) and notify the staff member.
+- **Done when:** an event created in the fake calendar removes the slot from the booking
+  page within 10 s, channels are renewed without a gap, and the race test ends with a
+  notification, not a hidden double booking.
+
+### B3 — Bookings that need several resources
+**Why:** a clinic visit needs a practitioner, a room, and sometimes a machine. Checking
+each one in app code races.
+1. `resources(id, tenant_id, kind)`, where staff become one kind, and
+   `booking_resources(booking_id, resource_id, during tstzrange)` with
+   `EXCLUDE USING gist (resource_id WITH =, during WITH &&)`. This replaces phase 3's
+   staff-only constraint.
+2. A service lists the resource kinds it needs. All of a booking's `booking_resources`
+   rows are inserted in one transaction: all or nothing.
+3. Availability search intersects each resource's free time with `tstzmultirange`
+   (PG 14+) instead of looping over slots in app code.
+- **Done when:** two simultaneous bookings that need the same room but different staff
+  end with exactly one success and one clean 409.
+
+### B4 — Deposits and no-show fees
+**Why:** no-shows are the top complaint of appointment businesses. This is money from
+the customer to the business, with the platform taking a fee: marketplace payments, not
+the SaaS billing of phase 4.
+1. Tenants connect a payout account through the provider (Stripe Connect, or Mercado
+   Pago's marketplace split). Track onboarding state: no deposits until it's complete.
+2. Services can require a deposit, charged at booking, with the platform fee split off.
+3. A cancellation policy per tenant, evaluated in the tenant's timezone: full refund more
+   than 24 h ahead, deposit kept after that. After a no-show, staff can charge the saved
+   card (off-session).
+4. A ledger per booking (charge, fee, refund, chargeback), reconciled nightly against
+   the provider.
+5. Extend `payments-mock` with connected accounts, split payments and saved cards.
+- **Done when:** book → late cancel → partial refund → chargeback leaves a ledger that
+  matches the mock provider's records to the cent.
+
+### B5 — Recurring appointments
+**Why:** a weekly therapy session for six months is one booking to the customer and 26
+rows to the database.
+1. Store a series as an RRULE (RFC 5545) with the tenant's timezone. The worker creates
+   occurrences ahead of time. Occurrences that don't exist yet aren't protected by the
+   exclusion constraint, so pick how far ahead to create them and say why.
+2. Edit "this one" or "this and following" (which splits the series), and cancel one occurrence.
+3. 10:00 local stays 10:00 local across DST changes: expand in local time, then convert to UTC.
+4. An occurrence that collides with an existing booking is reported to staff, never
+   silently dropped.
+- **Done when:** DST tests in two timezones pass, and a conflicting occurrence shows up
+  in the dashboard.
