@@ -15,6 +15,8 @@ jobs:
       - run: cp .env.example .env
       - name: Unit tests
         run: docker run --rm -v "$PWD/apps/api:/app" -w /app node:26.13-bookworm-slim node --test
+      - name: RLS guard + tenant isolation suite
+        run: sh infra/test.sh
       - name: Stack with 3 api replicas + smoke test
         run: sh common/scripts/ci-stack.sh 3
 

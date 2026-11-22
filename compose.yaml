@@ -9,7 +9,9 @@ include:
     env_file: .env
   - path: common/fakes/webhook-sink/compose.yaml
     env_file: .env
+# Owner role: migrations and seed. The api uses app-db-url (app_user, subject to RLS).
 x-db-url: &db-url postgres://${POSTGRES_USER:?copy .env.example to .env}:${POSTGRES_PASSWORD:?copy .env.example to .env}@db:5432/${POSTGRES_DB:?copy .env.example to .env}?sslmode=disable
+x-app-db-url: &app-db-url postgres://app_user:${APP_DB_PASSWORD:?copy .env.example to .env}@db:5432/${POSTGRES_DB}?sslmode=disable
 
 services:
   caddy:
@@ -33,7 +35,8 @@ services:
   api:
     build: ./apps/api
     environment:
-      DATABASE_URL: *db-url
+      DATABASE_URL: *app-db-url
+      SESSION_SECRET: ${SESSION_SECRET:?copy .env.example to .env}
     init: true
     stop_grace_period: 15s
     healthcheck:
@@ -63,10 +66,13 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql  # 18+ keeps data in a versioned subdir
+      - ./infra/db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      # ^ TCP, not the socket: the temporary server that runs init scripts only listens on the socket.
       interval: 3s
       timeout: 3s
       retries: 10
