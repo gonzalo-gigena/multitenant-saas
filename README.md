@@ -4,7 +4,7 @@ Appointment booking for small businesses, with isolated tenants, billing, an aud
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** skeleton. The stack runs, scales and passes CI. The product itself isn't built yet.
+> **Status:** Phase 1 of 8. Tenant isolation is built and tested. Login, roles and the booking product aren't built yet.
 
 ## Run it
 
@@ -28,13 +28,41 @@ Cloned without `--recurse-submodules`? Run `git submodule update --init`.
 | SQL shell | `docker compose exec db psql -U app app` |
 | Scale the api | `docker compose up -d --scale api=3` |
 | Prove scaling works | `sh common/scripts/smoke.sh 3` |
-| Run exactly what CI runs | `sh common/scripts/ci-stack.sh 3` |
+| Run exactly what CI runs | unit tests (below), `sh infra/test.sh`, then `sh common/scripts/ci-stack.sh 3`. The last two end with `down -v`. |
 | Load test at 1, 2, 4 replicas | `sh common/scripts/scale.sh` |
 | Metrics (Prometheus) | `docker compose --profile observability up -d`, then http://localhost:9090 |
+| RLS guard + tenant isolation suite | `sh infra/test.sh` |
 | Unit tests | `docker run --rm -v "$PWD/apps/api:/app" -w /app node:26.13-bookworm-slim node --test` |
 | New migration | add `infra/db/migrations/00000N_name.up.sql` + `.down.sql`, restart |
 | Update shared code | `git submodule update --remote common` |
 | Reset everything | `docker compose down -v` |
+
+## Tenant API
+
+Tenant routes live under `/api/t/<slug>`: `services` and `appointments`, each with list, create, get and delete.
+
+Until Phase 2 adds login, the caller is identified by a signed bearer token with no expiry.
+After seeding, this mints one for Alice, the owner of `demo`:
+
+```bash
+TOKEN=$(docker compose exec -T api node --input-type=module -e "import { sign } from '/app/src/auth.js'; console.log(sign(process.env.SESSION_SECRET, '00000000-0000-7000-8000-0000000000a1'))")
+curl -H "Authorization: Bearer $TOKEN" localhost:8080/api/t/demo/services
+```
+
+The same token on `/api/t/acme/services` returns 404, exactly like a tenant that doesn't exist.
+
+How isolation works:
+
+- The api connects as `app_user`: no superuser, no `BYPASSRLS`, no grants on `tenants`, `users` or `memberships`.
+  Migrations and the seed run as `POSTGRES_USER`, which owns the tables.
+- Every tenant request is one transaction. It starts by setting `app.tenant_id` from a membership lookup
+  (`member_tenant_id`, a `SECURITY DEFINER` function). The lookup finds nothing for non-members, so they get a 404.
+- Foreign keys between tenant tables include `tenant_id`, because FK checks skip RLS.
+- RLS protects against buggy queries, not against SQL injection: anything that can run SQL as `app_user`
+  can set `app.tenant_id` itself. Queries must stay parameterized.
+
+Have a database volume from before Phase 1? `app_user`'s password is only set when the volume is created,
+so run `docker compose down -v`, or set it by hand: `ALTER ROLE app_user PASSWORD '...'`.
 
 ## Fakes (from common)
 
@@ -104,8 +132,9 @@ All tenants share one schema. Postgres Row-Level Security filters every query by
 docker compose -f compose.yaml -f compose.prod.yaml up -d
 ```
 
-The server's `.env` needs `SITE_ADDRESS`, `IMAGE_REPO`, `TAG`, a strong password, and no `fakes`
-profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on every merge to `main`.
+The server's `.env` needs `SITE_ADDRESS`, `IMAGE_REPO`, `TAG`, strong values for `POSTGRES_PASSWORD`,
+`APP_DB_PASSWORD` and `SESSION_SECRET`, and no `fakes` profile. Phase 1 tokens don't expire, so don't
+expose this publicly before Phase 2. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on every merge to `main`.
 
 ## Decisions & tradeoffs
 
@@ -113,6 +142,8 @@ profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on ev
 |---|---|---|---|
 | Tenant isolation | Shared schema with Row-Level Security (`FORCE`, policies on `app.tenant_id`) | Schema per tenant, database per tenant | One migration path and one connection pool for every tenant, and the database enforces isolation instead of every query remembering a `WHERE`. Cost: a small cost per query (to be measured with `EXPLAIN ANALYZE`), and tenants share resources. A large tenant can still move to its own database through a tenant → connection-string table. |
 | Setting the tenant | `set_config('app.tenant_id', $1, true)` at the start of each transaction. The app connects as a role without `BYPASSRLS` | A session-level `SET`, or connecting as the table owner | A transaction-local setting is safe with PgBouncer transaction pooling. With no tenant set, `NULLIF` makes every policy return no rows instead of raising an error. |
+| References between tenant tables | Composite keys: `PRIMARY KEY (tenant_id, id)`, FKs on `(tenant_id, service_id)` | Plain FKs on `id` | FK checks skip RLS, so a plain FK would accept another tenant's ID and confirm that it exists. Cost: wider keys. |
+| Lookups before a tenant is known | No grants on `tenants`, `users`, `memberships`, one `SECURITY DEFINER` function that returns a tenant ID | Leaving those tables readable by the api | A bad query can't list every customer or user. Cost: each new pre-tenant lookup needs a function. |
 | Catching leaks | A CI test fails if any table with a `tenant_id` column lacks RLS and `FORCE`, and an isolation suite calls every route as tenant B with tenant A's IDs | Relying on code review | A new table without a policy is the most likely leak, and it's cheap to detect automatically. |
 | Double booking a staff member | Exclusion constraint `EXCLUDE USING gist (staff_id WITH =, tstzrange(starts_at, ends_at) WITH &&)` | Check, then insert, in app code | Two simultaneous requests can both pass an app-level check. The constraint can't be raced. |
 | Background jobs | pg-boss on Postgres | A Redis queue (BullMQ) | No extra service, and a job can be enqueued in the same transaction as the booking. Jobs carry `tenant_id` and set it the same way requests do. |
