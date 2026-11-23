@@ -4,26 +4,20 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
-import { sign } from '../src/auth.js';
 import { tenantRoutes } from '../src/routes.js';
+import { call, signIn } from './lib.mjs';
 
-const API = process.env.API_URL ?? 'http://caddy:8080';
-const SECRET = process.env.SESSION_SECRET;
 const db = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 1 }); // app_user, like the api
 
 // From infra/db/seed.sql.
-const A = { slug: 'demo', id: '00000000-0000-7000-8000-00000000000a', user: '00000000-0000-7000-8000-0000000000a1' };
-const B = { slug: 'acme', id: '00000000-0000-7000-8000-00000000000b', user: '00000000-0000-7000-8000-0000000000b1' };
+const A = { slug: 'demo', id: '00000000-0000-7000-8000-00000000000a', user: '00000000-0000-7000-8000-0000000000a1', email: 'alice@demo.test' };
+const B = { slug: 'acme', id: '00000000-0000-7000-8000-00000000000b', user: '00000000-0000-7000-8000-0000000000b1', email: 'bob@acme.test' };
 
-async function call(method, path, { token, body } = {}) {
-  const res = await fetch(`${API}${path}`, {
-    method,
-    headers: token ? { authorization: `Bearer ${token}` } : {},
-    body: body === undefined || typeof body === 'string' ? body : JSON.stringify(body),
-  });
-  return { status: res.status, text: await res.text() };
-}
-const as = (who, method, path, body, slug = who.slug) => call(method, `/api/t/${slug}${path}`, { token: who.token, body });
+// Only status and body: headers (request IDs, replica) differ between any two responses.
+const as = async (who, method, path, body, slug = who.slug) => {
+  const { status, text } = await call(method, `/api/t/${slug}${path}`, { who: who.session, body });
+  return { status, text };
+};
 
 async function create(who, path, body) {
   const res = await as(who, 'POST', path, body);
@@ -33,18 +27,22 @@ async function create(who, path, body) {
 
 before(async () => {
   for (const who of [A, B]) {
-    who.token = sign(SECRET, who.user);
+    who.session = await signIn(who.email);
     who.marker = `private-${randomUUID()}`;
     const service = await create(who, '/services', { name: who.marker, duration_min: 30, price_cents: 1000 });
     const appointment = await create(who, '/appointments', { service_id: service, customer_name: who.marker, starts_at: '2027-01-01T10:00:00Z' });
-    who.ids = { services: service, appointments: appointment };
+    const invite = await create(who, '/invites', { email: `${who.marker}@invitee.test`, role: 'staff' });
+    // Members are keyed by user id: the owner is the one member every tenant has.
+    who.ids = { services: service, appointments: appointment, invites: invite, members: who.user };
   }
 });
 after(() => db.end());
 
-// What an attacker sends to each POST: the victim's IDs in every field that could take one.
-// A new POST route fails this suite until it has an entry here.
+// What an attacker sends to each POST/PATCH: the victim's IDs in every field that could take one.
+// A new POST or PATCH route fails this suite until it has an entry here.
 const attackBody = {
+  'POST /invites': (victim) => ({ tenant_id: victim.id, email: 'smuggled@attacker.test', role: 'staff' }),
+  'PATCH /members/:id': (victim) => ({ tenant_id: victim.id, role: 'admin' }),
   'POST /services': (victim) => ({ id: victim.ids.services, tenant_id: victim.id, name: 'smuggled', duration_min: 30, price_cents: 1 }),
   'POST /appointments': (victim) => ({ tenant_id: victim.id, service_id: victim.ids.services, customer_name: 'smuggled', starts_at: '2027-01-02T10:00:00Z' }),
 };
@@ -74,7 +72,7 @@ for (const [attacker, victim] of [[B, A], [A, B]]) {
       assert.ok(id, `no test data for /${coll}: create some in before()`);
       const path = pattern.replace(':id', id);
       let body;
-      if (method === 'POST') {
+      if (method === 'POST' || method === 'PATCH') {
         assert.ok(attackBody[key], `no attack body for ${key}`);
         body = attackBody[key](victim);
       }
@@ -104,7 +102,7 @@ for (const [attacker, victim] of [[B, A], [A, B]]) {
       assertNoLeak(theirs, victim);
       assert.deepEqual(theirs, await as(attacker, method, path, body, 'no-such-tenant'));
 
-      const anonymous = await call(method, `/api/t/${victim.slug}${path}`, { body });
+      const anonymous = await as({}, method, path, body, victim.slug);
       assert.equal(anonymous.status, 401);
       assertNoLeak(anonymous, victim);
 
@@ -125,16 +123,24 @@ test('each tenant can read and delete its own rows', async () => {
 });
 
 test('routes outside /api/t show no tenant data', async () => {
-  const res = await call('GET', '/api/hello', { token: B.token });
+  const res = await call('GET', '/api/hello', { who: B.session });
   assert.equal(res.status, 200);
   assertNoLeak(res, A);
 });
 
-test('forged tokens get 401', async () => {
-  const [, bobsSignature] = B.token.split('.');
-  for (const token of [`${A.user}.${bobsSignature}`, A.user, `${A.user}.`, sign('wrong secret', A.user), 'nonsense']) {
-    assert.equal((await call('GET', '/api/t/demo/services', { token })).status, 401, token);
+test('forged or ended sessions get 401', async () => {
+  const s = B.session.sid;
+  const forged = [s.slice(0, -1) + (s.at(-1) === 'A' ? 'B' : 'A'), s.slice(1), '', 'nonsense', A.user];
+  for (const sid of forged) {
+    assert.equal((await call('GET', '/api/t/demo/services', { who: { sid, csrf: B.session.csrf } })).status, 401, sid);
   }
+  // Phase 1's bearer tokens are gone.
+  assert.equal((await call('GET', '/api/t/demo/services', { headers: { authorization: `Bearer ${A.user}.x` } })).status, 401);
+
+  const temp = await signIn(B.email);
+  assert.equal((await call('GET', '/api/me', { who: temp })).status, 200);
+  assert.equal((await call('POST', '/api/auth/logout', { who: temp })).status, 204);
+  assert.equal((await call('GET', '/api/me', { who: temp })).status, 401, 'logout must end the session server-side');
 });
 
 test('bad input is the client’s error, never a 500', async () => {
@@ -191,7 +197,9 @@ test('Postgres enforces isolation for app_user, whatever the app code does', asy
     await client.query('COMMIT');
 
     assert.equal(await count(), 0, 'the tenant must not outlive its transaction');
-    for (const table of ['tenants', 'users', 'memberships']) {
+    // memberships is readable now, but only through RLS (it counted 0 rows above with no tenant).
+    assert.equal((await client.query('SELECT count(*)::int AS n FROM memberships')).rows[0].n, 0);
+    for (const table of ['tenants', 'users', 'sessions']) {
       await assert.rejects(client.query(`SELECT * FROM ${table}`), { code: '42501' }, table);
     }
   } finally {

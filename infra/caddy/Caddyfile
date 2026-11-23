@@ -10,6 +10,7 @@ import /common/caddy/snippets.caddy
 
 	handle {
 		root * /srv
+		try_files {path} /index.html # /t/<slug>/… is the dashboard, one page for now
 		file_server
 	}
 }

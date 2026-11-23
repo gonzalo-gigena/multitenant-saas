@@ -3,31 +3,134 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Template up</title>
+  <title>Bookings dashboard</title>
   <style>
     :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-    body { max-width: 40rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; }
-    code { font-size: 1.1em; }
+    body { max-width: 44rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    header { display: flex; gap: 1rem; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+    form { display: flex; gap: .5rem; flex-wrap: wrap; align-items: end; margin: .5rem 0 1.5rem; }
+    label { display: grid; font-size: .9em; }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #8884; }
+    [hidden] { display: none !important; }
+    #error { color: #c33; }
   </style>
 </head>
 <body>
-  <h1>It runs.</h1>
-  <p>Message from the database: <code id="msg">…</code></p>
-  <p>Served by api replica: <code id="replica">…</code></p>
-  <p>Run <code>docker compose up -d --scale api=3</code> and watch the replica change.</p>
+  <p id="error" role="alert"></p>
+
+  <section id="signed-out" hidden>
+    <h1>Sign in</h1>
+    <form id="login">
+      <label>Email <input name="email" type="email" required autocomplete="email"></label>
+      <label>Password <input name="password" type="password" required minlength="8" autocomplete="current-password"></label>
+      <button>Sign in</button>
+      <button data-path="/api/auth/signup">Create account</button>
+    </form>
+    <h2>Or get a sign-in link</h2>
+    <form id="magic">
+      <label>Email <input name="email" type="email" required autocomplete="email"></label>
+      <button>Email me a link</button>
+    </form>
+    <p id="magic-sent" hidden>Check your inbox (locally: <a href="http://localhost:8025">Mailpit</a>).</p>
+  </section>
+
+  <section id="signed-in" hidden>
+    <header>
+      <label>Business <select id="switcher"></select></label>
+      <span><span id="me"></span> <button id="logout">Sign out</button></span>
+    </header>
+    <h2>New business</h2>
+    <form id="new-tenant">
+      <label>Name <input name="name" required></label>
+      <label>Address <input name="slug" required pattern="[a-z0-9][a-z0-9\-]{0,62}" placeholder="my-shop"></label>
+      <button>Create</button>
+    </form>
+    <div id="tenant" hidden>
+      <h2>Services</h2>
+      <table id="services"></table>
+      <form id="new-service" data-needs="owner admin">
+        <label>Name <input name="name" required></label>
+        <label>Minutes <input name="duration_min" type="number" min="1" value="30" required></label>
+        <label>Price (cents) <input name="price_cents" type="number" min="0" value="0" required></label>
+        <button>Add service</button>
+      </form>
+      <h2>Members</h2>
+      <table id="members"></table>
+      <form id="invite" data-needs="owner admin">
+        <label>Email <input name="email" type="email" required></label>
+        <label>Role <select name="role"><option>staff</option><option>admin</option></select></label>
+        <button>Invite</button>
+      </form>
+    </div>
+  </section>
+
   <script>
-    async function tick() {
-      try {
-        const r = await fetch('/api/hello');
-        const body = await r.json();
-        document.getElementById('msg').textContent = body.message ?? '(no rows, run: docker compose run --rm seed)';
-        document.getElementById('replica').textContent = body.replica;
-      } catch {
-        document.getElementById('replica').textContent = 'api unreachable';
-      }
+    // The tenant lives in the path (/t/<slug>), so the session cookie stays on one host.
+    let me;
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+    const slug = () => location.pathname.match(/^\/t\/([a-z0-9-]+)/)?.[1];
+
+    async function api(method, path, body) {
+      const res = await fetch(path, {
+        method,
+        headers: { 'content-type': 'application/json', ...(me ? { 'x-csrf-token': me.csrf } : {}) },
+        body: body && JSON.stringify(body),
+      });
+      const data = res.status === 204 ? null : await res.json();
+      if (!res.ok) throw new Error(data?.error ?? res.statusText);
+      return data;
     }
-    tick();
-    setInterval(tick, 1000);
+    const form = (el) => Object.fromEntries([...new FormData(el)].map(([k, v]) => [k, el[k].type === 'number' ? Number(v) : v]));
+    const on = (id, fn) => $(id).addEventListener('submit', async (e) => {
+      e.preventDefault();
+      $('error').textContent = '';
+      try { await fn(e.target, e.submitter); } catch (err) { $('error').textContent = err.message; }
+    });
+
+    on('login', async (el, button) => {
+      me = await api('POST', button.dataset.path ?? '/api/auth/login', form(el));
+      await load();
+    });
+    on('magic', async (el) => { await api('POST', '/api/auth/magic', form(el)); $('magic-sent').hidden = false; });
+    on('new-tenant', async (el) => { const t = await api('POST', '/api/tenants', form(el)); location.pathname = `/t/${t.slug}`; });
+    on('new-service', async (el) => { await api('POST', `/api/t/${slug()}/services`, form(el)); el.reset(); await loadTenant(); });
+    on('invite', async (el) => { await api('POST', `/api/t/${slug()}/invites`, form(el)); el.reset(); await loadTenant(); });
+    $('logout').onclick = async () => { await api('POST', '/api/auth/logout'); location.href = '/'; };
+    $('switcher').onchange = (e) => { location.pathname = `/t/${e.target.value}`; };
+
+    async function load() {
+      try { me = await api('GET', '/api/me'); } catch { me = null; }
+      $('signed-out').hidden = !!me;
+      $('signed-in').hidden = !me;
+      if (!me) return;
+      const invite = new URLSearchParams(location.search).get('invite');
+      if (invite) {
+        const t = await api('POST', '/api/invites/accept', { token: invite });
+        return location.replace(`/t/${t.slug}`);
+      }
+      if (!slug() && me.tenants[0]) return location.replace(`/t/${me.tenants[0].slug}`);
+      $('me').textContent = me.email;
+      $('switcher').innerHTML = me.tenants.map((t) =>
+        `<option value="${esc(t.slug)}" ${t.slug === slug() ? 'selected' : ''}>${esc(t.name)} (${esc(t.role)})</option>`).join('');
+      await loadTenant();
+    }
+
+    async function loadTenant() {
+      const role = me.tenants.find((t) => t.slug === slug())?.role;
+      $('tenant').hidden = !role;
+      if (!role) return;
+      // The API enforces roles. Hiding forms is only so nobody clicks into a 403.
+      for (const el of document.querySelectorAll('[data-needs]')) el.hidden = !el.dataset.needs.split(' ').includes(role);
+      const services = await api('GET', `/api/t/${slug()}/services`);
+      $('services').innerHTML = services.map((s) => `<tr><td>${esc(s.name)}</td><td>${s.duration_min} min</td><td>${(s.price_cents / 100).toFixed(2)}</td></tr>`).join('');
+      const members = await api('GET', `/api/t/${slug()}/members`);
+      $('members').innerHTML = members.map((m) => `<tr><td>${esc(m.email)}</td><td>${esc(m.role)}</td></tr>`).join('');
+    }
+
+    if (new URLSearchParams(location.search).get('error')) $('error').textContent = 'That link expired. Ask for a new one.';
+    load().catch((err) => { $('error').textContent = err.message; });
   </script>
 </body>
 </html>
