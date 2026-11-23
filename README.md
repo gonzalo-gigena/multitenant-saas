@@ -4,7 +4,7 @@ Appointment booking for small businesses, with isolated tenants, billing, an aud
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** Phase 1 of 8. Tenant isolation is built and tested. Login, roles and the booking product aren't built yet.
+> **Status:** Phase 2 of 8. Tenant isolation, sign-in, organizations and roles are built and tested. The booking product isn't built yet.
 
 ## Run it
 
@@ -15,7 +15,7 @@ cp .env.example .env
 docker compose up --watch
 ```
 
-Open http://localhost:8080. Needs only Docker with Compose v2. Code changes reload
+Open http://localhost:8080 and sign in as `alice@demo.test` / `demo-password` after seeding, or create an account. Needs only Docker with Compose v2. Code changes reload
 automatically (Compose Watch). On Windows, clone inside the WSL filesystem, not `/mnt/c`.
 
 Cloned without `--recurse-submodules`? Run `git submodule update --init`.
@@ -31,32 +31,66 @@ Cloned without `--recurse-submodules`? Run `git submodule update --init`.
 | Run exactly what CI runs | unit tests (below), `sh infra/test.sh`, then `sh common/scripts/ci-stack.sh 3`. The last two end with `down -v`. |
 | Load test at 1, 2, 4 replicas | `sh common/scripts/scale.sh` |
 | Metrics (Prometheus) | `docker compose --profile observability up -d`, then http://localhost:9090 |
-| RLS guard + tenant isolation suite | `sh infra/test.sh` |
+| RLS guard, tenant isolation suite, role matrix | `sh infra/test.sh` |
+| Lint migrations (lock rules) | `sh common/scripts/check-migrations.sh` |
+| Read sign-in links and invites | http://localhost:8025 (Mailpit) |
 | Unit tests | `docker run --rm -v "$PWD/apps/api:/app" -w /app node:26.13-bookworm-slim node --test` |
 | New migration | add `infra/db/migrations/00000N_name.up.sql` + `.down.sql`, restart |
 | Update shared code | `git submodule update --remote common` |
 | Reset everything | `docker compose down -v` |
 
-## Tenant API
+## Sign-in, organizations, roles
 
-Tenant routes live under `/api/t/<slug>`: `services` and `appointments`, each with list, create, get and delete.
+- **Sign up / sign in** with email + password (argon2id, from `node:crypto`), or with a magic link sent by email.
+  The first magic-link sign-in creates the account.
+- **Sessions** are a random token in an `HttpOnly; SameSite=Lax` cookie (`Secure` when `APP_URL` is https).
+  Postgres keeps only the token's SHA-256, so any api replica can check it and logout ends it everywhere.
+- **CSRF:** every mutation needs `x-csrf-token` (an HMAC of the session, returned by sign-in and `GET /api/me`),
+  and a request whose `Origin` isn't this host gets a 403. That also covers sign-in, which has no session yet.
+- **Organizations:** a user can belong to several tenants. `GET /api/me` lists them with the user's role there,
+  and the dashboard's switcher moves between `/t/<slug>` paths. `POST /api/tenants` creates one, with the caller as owner.
+- **Invites** are emailed links that sign `(tenant, invite id)`. The invite row expires after 7 days, is deleted on
+  use or revoke, and only works for the invited email. Invites make admins or staff, never owners.
 
-Until Phase 2 adds login, the caller is identified by a signed bearer token with no expiry.
-After seeding, this mints one for Alice, the owner of `demo`:
+Tenant routes live under `/api/t/<slug>`: `services`, `appointments`, `members` and `invites`.
 
 ```bash
-TOKEN=$(docker compose exec -T api node --input-type=module -e "import { sign } from '/app/src/auth.js'; console.log(sign(process.env.SESSION_SECRET, '00000000-0000-7000-8000-0000000000a1'))")
-curl -H "Authorization: Bearer $TOKEN" localhost:8080/api/t/demo/services
+curl -c jar -H 'content-type: application/json' -d '{"email":"alice@demo.test","password":"demo-password"}' localhost:8080/api/auth/login
+curl -b jar localhost:8080/api/t/demo/services
 ```
 
-The same token on `/api/t/acme/services` returns 404, exactly like a tenant that doesn't exist.
+The same cookie on `/api/t/acme/services` returns 404, exactly like a tenant that doesn't exist.
 
-How isolation works:
+### Roles
 
-- The api connects as `app_user`: no superuser, no `BYPASSRLS`, no grants on `tenants`, `users` or `memberships`.
+Every tenant route names one `(action, resource)` pair, and the server calls `can(member, action, resource)`
+before the handler runs. Members get 403, non-members 404. This table is checked against
+[`permissions.js`](apps/api/src/permissions.js) by `integration/roles.js`, which also calls every route as every
+role, so each cell is tested.
+
+| Resource | Action | owner | admin | staff |
+|---|---|---|---|---|
+| `services` | `read` | ✅ | ✅ | ✅ |
+| `services` | `write` | ✅ | ✅ | — |
+| `appointments` | `read` | ✅ | ✅ | ✅ |
+| `appointments` | `write` | ✅ | ✅ | ✅ |
+| `members` | `read` | ✅ | ✅ | ✅ |
+| `members` | `manage` | ✅ | — | — |
+| `invites` | `read` | ✅ | ✅ | — |
+| `invites` | `write` | ✅ | ✅ | — |
+
+`write` is create and delete. `members manage` changes a role or removes a member, but never an owner,
+so every tenant keeps at least one.
+
+### How isolation works
+
+- The api connects as `app_user`: no superuser, no `BYPASSRLS`, no grants on `tenants` or `users`, and only `INSERT` on `sessions`.
   Migrations and the seed run as `POSTGRES_USER`, which owns the tables.
+- Lookups before a tenant is known (sign-in, the session, a user's tenants, creating a tenant) go through small
+  `SECURITY DEFINER` functions that return only what the caller needs.
 - Every tenant request is one transaction. It starts by setting `app.tenant_id` from a membership lookup
-  (`member_tenant_id`, a `SECURITY DEFINER` function). The lookup finds nothing for non-members, so they get a 404.
+  (`member_tenant_id`). The lookup finds nothing for non-members, so they get a 404.
+  `memberships` and `invites` are tenant tables under RLS like the rest.
 - Foreign keys between tenant tables include `tenant_id`, because FK checks skip RLS.
 - RLS protects against buggy queries, not against SQL injection: anything that can run SQL as `app_user`
   can set `app.tenant_id` itself. Queries must stay parameterized.
@@ -107,6 +141,7 @@ flowchart LR
   api -.-> redis
   api -.-> minio
   api <-.->|"checkout, signed webhooks"| pay
+  api -->|"sign-in links, invites"| mail
   worker -.-> mail
   worker -.->|"signed outgoing webhooks"| sink
   class customers,integrations,web,worker,bouncer,redis,minio planned
@@ -133,8 +168,8 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d
 ```
 
 The server's `.env` needs `SITE_ADDRESS`, `IMAGE_REPO`, `TAG`, strong values for `POSTGRES_PASSWORD`,
-`APP_DB_PASSWORD` and `SESSION_SECRET`, and no `fakes` profile. Phase 1 tokens don't expire, so don't
-expose this publicly before Phase 2. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on every merge to `main`.
+`APP_DB_PASSWORD` and `SESSION_SECRET`, `APP_URL=https://yourdomain.com`, an `SMTP_URL` relay, and no
+`fakes` profile. Sign-in has no rate limit until Phase 6, so put one in front (or wait) before going public. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on every merge to `main`.
 
 ## Decisions & tradeoffs
 
@@ -143,7 +178,13 @@ expose this publicly before Phase 2. Caddy gets TLS automatically. CI pushes mul
 | Tenant isolation | Shared schema with Row-Level Security (`FORCE`, policies on `app.tenant_id`) | Schema per tenant, database per tenant | One migration path and one connection pool for every tenant, and the database enforces isolation instead of every query remembering a `WHERE`. Cost: a small cost per query (to be measured with `EXPLAIN ANALYZE`), and tenants share resources. A large tenant can still move to its own database through a tenant → connection-string table. |
 | Setting the tenant | `set_config('app.tenant_id', $1, true)` at the start of each transaction. The app connects as a role without `BYPASSRLS` | A session-level `SET`, or connecting as the table owner | A transaction-local setting is safe with PgBouncer transaction pooling. With no tenant set, `NULLIF` makes every policy return no rows instead of raising an error. |
 | References between tenant tables | Composite keys: `PRIMARY KEY (tenant_id, id)`, FKs on `(tenant_id, service_id)` | Plain FKs on `id` | FK checks skip RLS, so a plain FK would accept another tenant's ID and confirm that it exists. Cost: wider keys. |
-| Lookups before a tenant is known | No grants on `tenants`, `users`, `memberships`, one `SECURITY DEFINER` function that returns a tenant ID | Leaving those tables readable by the api | A bad query can't list every customer or user. Cost: each new pre-tenant lookup needs a function. |
+| Lookups before a tenant is known | No grants on `tenants` or `users`, `INSERT` only on `sessions`. Small `SECURITY DEFINER` functions (sign-in, session, a user's tenants) | Leaving those tables readable by the api | A bad query can't list every customer, user or session. Cost: each new pre-tenant lookup needs a function. `memberships` became an RLS tenant table in Phase 2, since members are managed inside a tenant. |
+| Passwords | argon2id at OWASP's minimum (19 MiB, 2 passes), stdlib `crypto.argon2`, PHC strings | bcrypt, an npm argon2 binding | No native dependency. PHC strings carry their parameters, so the cost can rise without breaking old hashes. Cost: about 250 ms of CPU per sign-in on a laptop's Docker VM, which is also what slows guessing. Unknown emails are checked against a dummy hash, so they take as long as a wrong password. |
+| Sessions | Random token in an `HttpOnly; SameSite=Lax` cookie, SHA-256 stored in Postgres, 14 days | Signed stateless cookies (JWT) | Logout and removal take effect at once, on every replica, and a leaked table opens no sessions. Cost: one query per request. |
+| CSRF | A per-session HMAC token in `x-csrf-token` on every mutation, plus an `Origin` check | `SameSite=Lax` alone | Lax stops cross-site POSTs, but every tenant's booking page is a same-site subdomain, and Lax doesn't help sign-in (no session yet). The token needs no storage: it's derived from the session. |
+| Roles | One `can(member, action, resource)` over a static matrix. Every route declares its pair, and the test calls every route as every role | Checks inside each handler, a policy engine | One table to read and one place to change. A route can't skip the check, because the router calls it. Cost: no per-row rules yet (staff seeing only their own bookings comes with Phase 3's staff). |
+| Invites | Emailed link signing `(tenant, invite id)`. The row holds the email, role and expiry, and accepting deletes it | A stateless signed token with an expiry inside | The row makes a link single-use and revocable, so a removed member can't rejoin with their old link. Accepting needs the invited email's account. |
+| Magic links | Signed `(email, expiry)`, 15 minutes, usable until it expires | Single-use links stored in a table | Mail scanners prefetch links and would burn a single-use one. Anyone who can read the inbox could request a new link anyway. Links are built from `APP_URL`, never the `Host` header, so a spoofed host can't steal them. |
 | Catching leaks | A CI test fails if any table with a `tenant_id` column lacks RLS and `FORCE`, and an isolation suite calls every route as tenant B with tenant A's IDs | Relying on code review | A new table without a policy is the most likely leak, and it's cheap to detect automatically. |
 | Double booking a staff member | Exclusion constraint `EXCLUDE USING gist (staff_id WITH =, tstzrange(starts_at, ends_at) WITH &&)` | Check, then insert, in app code | Two simultaneous requests can both pass an app-level check. The constraint can't be raced. |
 | Background jobs | pg-boss on Postgres | A Redis queue (BullMQ) | No extra service, and a job can be enqueued in the same transaction as the booking. Jobs carry `tenant_id` and set it the same way requests do. |
